@@ -1,0 +1,285 @@
+diff --git a/Documentation/admin-guide/sysctl/kernel.rst b/Documentation/admin-guide/sysctl/kernel.rst
+index 24ab20d7a50a..1abab69dd5b6 100644
+--- a/Documentation/admin-guide/sysctl/kernel.rst
++++ b/Documentation/admin-guide/sysctl/kernel.rst
+@@ -608,6 +608,24 @@ numa_balancing_scan_delay_ms, numa_balancing_scan_period_max_ms,
+ numa_balancing_scan_size_mb`_, and numa_balancing_settle_count sysctls.
+ 
+ 
++By default, NUMA hinting faults are generate on both toptier and non-toptier
++nodes. However, in a tiered-memory system, hot memories in toptier memory nodes
++may not need to be migrated around. In such cases, it's unnecessary to scan the
++pages in the toptier memory nodes. For a tiered-memory system, unnecessary scannings
++and hinting faults in the toptier nodes are disabled.
++
++This interface takes bits field as input. Supported values and corresponding modes are
++as follow:
++
++- 0x0: NUMA_BALANCING_DISABLED
++- 0x1: NUMA_BALANCING_NORMAL
++- 0x2: NUMA_BALANCING_TIERED_MEMORY
++
++If a system has single toptier node online, then default NUMA balancing will
++automatically be downgraded to the tiered-memory mode to avoid the unnecessary scanning
++and hinting faults.
++
++
+ numa_balancing_scan_period_min_ms, numa_balancing_scan_delay_ms, numa_balancing_scan_period_max_ms, numa_balancing_scan_size_mb
+ ===============================================================================================================================
+ 
+diff --git a/include/linux/mempolicy.h b/include/linux/mempolicy.h
+index c7637cfa1be2..ab57b6a82e0a 100644
+--- a/include/linux/mempolicy.h
++++ b/include/linux/mempolicy.h
+@@ -188,6 +188,7 @@ extern int mpol_misplaced(struct page *, struct vm_area_struct *, unsigned long,
+ extern void mpol_put_task_policy(struct task_struct *);
+ 
+ extern bool numa_demotion_enabled;
++extern bool numa_promotion_tiered_enabled;
+ 
+ #else
+ 
+@@ -299,5 +300,6 @@ static inline nodemask_t *policy_nodemask_current(gfp_t gfp)
+ }
+ 
+ #define numa_demotion_enabled	false
++#define numa_promotion_tiered_enabled	false
+ #endif /* CONFIG_NUMA */
+ #endif
+diff --git a/include/linux/node.h b/include/linux/node.h
+index 8e5a29897936..9a69b31cae74 100644
+--- a/include/linux/node.h
++++ b/include/linux/node.h
+@@ -181,4 +181,11 @@ static inline void register_hugetlbfs_with_node(node_registration_func_t reg,
+ 
+ #define to_node(device) container_of(device, struct node, dev)
+ 
++static inline bool node_is_toptier(int node)
++{
++	// ideally, toptier nodes should be the memory with CPU.
++	// for now, just assume node0 is the toptier memory
++	// return node_state(node, N_CPU);
++	return (node == 0);
++}
+ #endif /* _LINUX_NODE_H_ */
+diff --git a/include/linux/sched/sysctl.h b/include/linux/sched/sysctl.h
+index 3c31ba88aca5..249e00c42246 100644
+--- a/include/linux/sched/sysctl.h
++++ b/include/linux/sched/sysctl.h
+@@ -39,6 +39,12 @@ enum sched_tunable_scaling {
+ };
+ extern enum sched_tunable_scaling sysctl_sched_tunable_scaling;
+ 
++#define NUMA_BALANCING_DISABLED			0x0
++#define NUMA_BALANCING_NORMAL			0x1
++#define NUMA_BALANCING_TIERED_MEMORY	0x2
++
++extern int sysctl_numa_balancing_mode;
++
+ extern unsigned int sysctl_numa_balancing_scan_delay;
+ extern unsigned int sysctl_numa_balancing_scan_period_min;
+ extern unsigned int sysctl_numa_balancing_scan_period_max;
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 790c573f7ed4..3d65e601b973 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -3596,9 +3596,29 @@ static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
+ }
+ 
+ DEFINE_STATIC_KEY_FALSE(sched_numa_balancing);
++int sysctl_numa_balancing_mode;
++bool numa_promotion_tiered_enabled;
+ 
+ #ifdef CONFIG_NUMA_BALANCING
+ 
++/*
++ * If there is only one toptier node available, pages on that
++ * node can not be promotrd to anywhere. In that case, downgrade
++ * to numa_promotion_tiered_enabled mode
++ */
++static void check_numa_promotion_mode(void)
++{
++	int node, toptier_node_count = 0;
++
++	for_each_online_node(node) {
++		if (node_is_toptier(node))
++			++toptier_node_count;
++	}
++	if (toptier_node_count == 1) {
++		numa_promotion_tiered_enabled = true;
++	}
++}
++
+ void set_numabalancing_state(bool enabled)
+ {
+ 	if (enabled)
+@@ -3611,20 +3631,22 @@ void set_numabalancing_state(bool enabled)
+ int sysctl_numa_balancing(struct ctl_table *table, int write,
+ 			  void *buffer, size_t *lenp, loff_t *ppos)
+ {
+-	struct ctl_table t;
+ 	int err;
+-	int state = static_branch_likely(&sched_numa_balancing);
+ 
+ 	if (write && !capable(CAP_SYS_ADMIN))
+ 		return -EPERM;
+ 
+-	t = *table;
+-	t.data = &state;
+-	err = proc_dointvec_minmax(&t, write, buffer, lenp, ppos);
++	err = proc_dointvec_minmax(table, write, buffer, lenp, ppos);
+ 	if (err < 0)
+ 		return err;
+-	if (write)
+-		set_numabalancing_state(state);
++	if (write) {
++		if (sysctl_numa_balancing_mode & NUMA_BALANCING_NORMAL)
++			check_numa_promotion_mode();
++		else if (sysctl_numa_balancing_mode & NUMA_BALANCING_TIERED_MEMORY)
++			numa_promotion_tiered_enabled = true;
++
++		set_numabalancing_state(*(int *)table->data);
++	}
+ 	return err;
+ }
+ #endif
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 210612c9d1e9..45e39832a2b1 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -1424,7 +1424,7 @@ bool should_numa_migrate_memory(struct task_struct *p, struct page * page,
+ 
+ 	count_vm_numa_event(PGPROMOTE_CANDIDATE);
+ 
+-	if (flags & TNF_DEMOTED)
++	if (numa_demotion_enabled && (flags & TNF_DEMOTED))
+ 		count_vm_numa_event(PGPROMOTE_CANDIDATE_DEMOTED);
+ 
+ 	if (page_is_file_lru(page))
+@@ -1435,6 +1435,14 @@ bool should_numa_migrate_memory(struct task_struct *p, struct page * page,
+ 	this_cpupid = cpu_pid_to_cpupid(dst_cpu, current->pid);
+ 	last_cpupid = page_cpupid_xchg_last(page, this_cpupid);
+ 
++	/*
++	 * The pages in non-toptier memory node should be migrated
++	 * according to hot/cold instead of accessing CPU node.
++	 */
++	if (numa_promotion_tiered_enabled && !node_is_toptier(src_nid))
++		return true;
++
++
+ 	/*
+ 	 * Allow first faults or private faults to migrate immediately early in
+ 	 * the lifetime of a task. The magic number 4 is based on waiting for
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 6057ad67d223..379f3b6f1a3f 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -51,6 +51,7 @@
+ #include <linux/kthread.h>
+ #include <linux/membarrier.h>
+ #include <linux/migrate.h>
++#include <linux/mempolicy.h>
+ #include <linux/mm_inline.h>
+ #include <linux/mmu_context.h>
+ #include <linux/nmi.h>
+diff --git a/kernel/sysctl.c b/kernel/sysctl.c
+index 6b6653529d92..751b52062eb4 100644
+--- a/kernel/sysctl.c
++++ b/kernel/sysctl.c
+@@ -113,6 +113,7 @@ static int sixty = 60;
+ 
+ static int __maybe_unused neg_one = -1;
+ static int __maybe_unused two = 2;
++static int __maybe_unused three = 3;
+ static int __maybe_unused four = 4;
+ static unsigned long zero_ul;
+ static unsigned long one_ul = 1;
+@@ -1840,12 +1841,12 @@ static struct ctl_table kern_table[] = {
+ 	},
+ 	{
+ 		.procname	= "numa_balancing",
+-		.data		= NULL, /* filled in by handler */
+-		.maxlen		= sizeof(unsigned int),
++		.data		= &sysctl_numa_balancing_mode,
++		.maxlen		= sizeof(int),
+ 		.mode		= 0644,
+ 		.proc_handler	= sysctl_numa_balancing,
+ 		.extra1		= SYSCTL_ZERO,
+-		.extra2		= SYSCTL_ONE,
++		.extra2		= &three,
+ 	},
+ #endif /* CONFIG_NUMA_BALANCING */
+ #endif /* CONFIG_SCHED_DEBUG */
+diff --git a/mm/huge_memory.c b/mm/huge_memory.c
+index e9d7b9125c5e..b76a0990c5f1 100644
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@ -22,6 +22,7 @@
+ #include <linux/freezer.h>
+ #include <linux/pfn_t.h>
+ #include <linux/mman.h>
++#include <linux/mempolicy.h>
+ #include <linux/memremap.h>
+ #include <linux/pagemap.h>
+ #include <linux/debugfs.h>
+@@ -1849,16 +1850,24 @@ int change_huge_pmd(struct vm_area_struct *vma, pmd_t *pmd,
+ 	}
+ #endif
+ 
+-	/*
+-	 * Avoid trapping faults against the zero page. The read-only
+-	 * data is likely to be read-cached on the local CPU and
+-	 * local/remote hits to the zero page are not interesting.
+-	 */
+-	if (prot_numa && is_huge_zero_pmd(*pmd))
+-		goto unlock;
++	if (prot_numa) {
++		struct page *page;
++		/*
++		 * Avoid trapping faults against the zero page. The read-only
++		 * data is likely to be read-cached on the local CPU and
++		 * local/remote hits to the zero page are not interesting.
++		 */
++		if (is_huge_zero_pmd(*pmd))
++			goto unlock;
+ 
+-	if (prot_numa && pmd_protnone(*pmd))
+-		goto unlock;
++		if (pmd_protnone(*pmd))
++			goto unlock;
++
++		/* skip scanning toptier node */
++		page = pmd_page(*pmd);
++		if (numa_promotion_tiered_enabled && node_is_toptier(page_to_nid(page)))
++			goto unlock;
++	}
+ 
+ 	/*
+ 	 * In case prot_numa, we are under mmap_read_lock(mm). It's critical
+diff --git a/mm/mprotect.c b/mm/mprotect.c
+index 94188df1ee55..3171f435925b 100644
+--- a/mm/mprotect.c
++++ b/mm/mprotect.c
+@@ -83,6 +83,7 @@ static unsigned long change_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
+ 			 */
+ 			if (prot_numa) {
+ 				struct page *page;
++				int nid;
+ 
+ 				/* Avoid TLB flush if possible */
+ 				if (pte_protnone(oldpte))
+@@ -109,7 +110,12 @@ static unsigned long change_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
+ 				 * Don't mess with PTEs if page is already on the node
+ 				 * a single-threaded process is running on.
+ 				 */
+-				if (target_node == page_to_nid(page))
++				nid = page_to_nid(page);
++				if (target_node == nid)
++					continue;
++
++				/* skip scanning toptier node */
++				if (numa_promotion_tiered_enabled && node_is_toptier(nid))
+ 					continue;
+ 			}
+ 
